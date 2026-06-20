@@ -6,12 +6,17 @@ from app.core.config import get_settings
 
 settings = get_settings()
 
+connect_args = {}
+# Only apply local SQLite specific connect arguments
+if settings.database_url.startswith("sqlite:///"):
+    connect_args = {
+        "check_same_thread": False,
+        "timeout": 15,
+    }
+
 engine = create_engine(
     settings.database_url,
-    connect_args={
-        "check_same_thread": False,
-        "timeout": 15,  # Increase timeout for concurrent access
-    },
+    connect_args=connect_args,
 )
 
 @event.listens_for(Engine, "connect")
