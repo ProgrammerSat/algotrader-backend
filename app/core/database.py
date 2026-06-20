@@ -18,6 +18,10 @@ db_url = settings.database_url
 if "turso.io/?" in db_url:
     db_url = db_url.replace("turso.io/?", "turso.io?")
 
+if "turso.io" in db_url and "secure=" not in db_url:
+    separator = "&" if "?" in db_url else "?"
+    db_url += f"{separator}secure=true"
+
 engine = create_engine(
     db_url,
     connect_args=connect_args,
