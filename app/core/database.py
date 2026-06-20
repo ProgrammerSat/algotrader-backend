@@ -14,9 +14,23 @@ if settings.database_url.startswith("sqlite:///"):
         "timeout": 15,
     }
 
+import urllib.parse
+
 db_url = settings.database_url
-if "turso.io/?" in db_url:
-    db_url = db_url.replace("turso.io/?", "turso.io?")
+if "turso.io" in db_url:
+    parsed = urllib.parse.urlparse(db_url)
+    query = urllib.parse.parse_qs(parsed.query)
+    
+    if "authToken" in query:
+        connect_args["auth_token"] = query["authToken"][0]
+        del query["authToken"]
+        
+    new_query = urllib.parse.urlencode(query, doseq=True)
+    new_parsed = parsed._replace(query=new_query)
+    db_url = urllib.parse.urlunparse(new_parsed)
+    
+    if "turso.io/?" in db_url:
+        db_url = db_url.replace("turso.io/?", "turso.io?")
 
 if "turso.io" in db_url and "secure=" not in db_url:
     separator = "&" if "?" in db_url else "?"
