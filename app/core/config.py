@@ -20,6 +20,7 @@ class Settings(BaseSettings):
     app_env: str = "development"
 
     gemini_api_key: str = ""  # Google Gemini API key for AI screener
+    cors_origins: str = "http://localhost:5173,http://localhost:3000"
 
     class Config:
         env_file = ".env"
