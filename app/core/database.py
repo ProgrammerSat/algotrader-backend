@@ -14,8 +14,12 @@ if settings.database_url.startswith("sqlite:///"):
         "timeout": 15,
     }
 
+db_url = settings.database_url
+if "turso.io/?" in db_url:
+    db_url = db_url.replace("turso.io/?", "turso.io?")
+
 engine = create_engine(
-    settings.database_url,
+    db_url,
     connect_args=connect_args,
 )
 
