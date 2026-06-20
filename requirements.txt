@@ -18,3 +18,4 @@ aiohttp>=3.9.0
 google-genai>=1.0.0
 yfinance
 sqlalchemy-libsql
+email-validator
