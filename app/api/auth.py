@@ -90,5 +90,21 @@ def fyers_link_manual(
     set_fyers_client(access_token)
     return {"detail": "Fyers account linked successfully", "fyers_linked": True}
 
-
-
+@router.get("/fyers/status")
+def fyers_status(current_user: User = Depends(get_current_user)):
+    """Check if the Fyers connection is actually active and the token is valid."""
+    if not current_user.fyers_linked:
+        return {"fyers_active": False}
+    
+    from app.core.fyers_client import get_fyers_client
+    client = get_fyers_client()
+    if not client:
+        return {"fyers_active": False}
+    
+    try:
+        profile = client.get_profile()
+        if profile and profile.get("s") == "ok":
+            return {"fyers_active": True}
+        return {"fyers_active": False}
+    except Exception:
+        return {"fyers_active": False}
