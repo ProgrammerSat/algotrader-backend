@@ -14,6 +14,22 @@ class TradeLogCreate(BaseModel):
     notes: Optional[str] = None
     is_paper: int = 1
     strategy_id: Optional[int] = None
+    entry_time: Optional[datetime] = None
+    exit_time: Optional[datetime] = None
+
+class TradeLogUpdate(BaseModel):
+    symbol: Optional[str] = None
+    side: Optional[str] = None
+    quantity: Optional[int] = None
+    entry_price: Optional[float] = None
+    exit_price: Optional[float] = None
+    pnl: Optional[float] = None
+    pnl_pct: Optional[float] = None
+    notes: Optional[str] = None
+    is_paper: Optional[int] = None
+    strategy_id: Optional[int] = None
+    entry_time: Optional[datetime] = None
+    exit_time: Optional[datetime] = None
 
 
 class TradeLogOut(BaseModel):

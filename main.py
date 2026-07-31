@@ -16,7 +16,13 @@ Base.metadata.create_all(bind=engine)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """On startup: restore the Fyers client from the DB so restarts don't break the link."""
+    """On startup: restore the Fyers client and initialize the symbol master."""
+    from app.core.symbol_master import init_symbol_master
+    import threading
+    
+    # Initialize symbol master in a background thread so startup isn't delayed
+    threading.Thread(target=init_symbol_master, daemon=True).start()
+
     db = SessionLocal()
     try:
         from app.models.user import User
@@ -41,7 +47,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="AlgoTrader API",
+    title="Wealth Marathon API",
     description="Algorithmic Trading Platform powered by Fyers API",
     version="1.0.0",
     docs_url="/docs",
@@ -77,7 +83,7 @@ app.include_router(ai_screener.router)
 
 @app.get("/")
 def root():
-    return {"message": "AlgoTrader API is running 🚀", "docs": "/docs"}
+    return {"message": "Wealth Marathon API is running 🚀", "docs": "/docs"}
 
 
 @app.get("/health")

@@ -7,7 +7,9 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from app.core.fyers_client import get_fyers_client
 from app.deps import get_current_user
 from app.models.user import User
-
+from sqlalchemy.orm import Session
+from app.core.database import get_db
+from app.models.market_data import WMMarketSpread, WMIndexSentimentAnalysis
 router = APIRouter(prefix="/api/market", tags=["market"])
 
 # Conservative chunk sizes (days) that Fyers reliably handles per request
@@ -114,6 +116,8 @@ def get_fundamentals(
             "fiftyTwoWeekLow": info.get("fiftyTwoWeekLow", 0),
             "priceToBook": info.get("priceToBook", 0),
             "trailingEps": info.get("trailingEps", 0),
+            "revenueGrowth": info.get("revenueGrowth", None),
+            "earningsGrowth": info.get("earningsQuarterlyGrowth", None),
             "sector": info.get("sector", "N/A"),
             "industry": info.get("industry", "N/A"),
             "shortName": info.get("shortName", yf_symbol)
@@ -235,13 +239,14 @@ def get_market_depth(
 
 
 @router.get("/search")
-def search_symbols(
+def search_symbols_endpoint(
     q: str = Query(..., min_length=2),
+    limit: int = Query(20, le=50),
     current_user: User = Depends(get_current_user),
 ):
-    fyers = _require_fyers()
-    response = fyers.symbol_master({"exchange": "NSE", "segment": "CM"})
-    return response
+    from app.core.symbol_master import search_symbols as do_search
+    results = do_search(q, limit=limit)
+    return {"s": "ok", "data": results}
 
 
 @router.get("/analysis")
@@ -475,3 +480,158 @@ def get_market_breadth(
     _BREADTH_CACHE["timestamp"] = time.time()
     
     return {"s": "ok", "data": final_data[-days:] if days < len(final_data) else final_data}
+
+
+@router.get("/quarterly")
+def get_quarterly_results(
+    symbol: str = Query(..., description="Fyers symbol (e.g., NSE:RELIANCE-EQ)"),
+    current_user: User = Depends(get_current_user),
+):
+    import yfinance as yf
+    import pandas as pd
+    import numpy as np
+
+    try:
+        parts = symbol.split(':')
+        if len(parts) == 2:
+            exchange = parts[0]
+            ticker_part = parts[1].replace('-EQ', '').replace('-INDEX', '')
+            yf_symbol = f"{ticker_part}.NS" if exchange == 'NSE' else (f"{ticker_part}.BO" if exchange == 'BSE' else ticker_part)
+        else:
+            yf_symbol = symbol
+
+        ticker = yf.Ticker(yf_symbol)
+        
+        inc_stmt = ticker.quarterly_income_stmt
+        cash_flow = ticker.quarterly_cash_flow
+        
+        if inc_stmt is None or inc_stmt.empty:
+            return {"s": "ok", "data": []}
+
+        results = []
+        
+        # Columns are usually newest to oldest, we want to reverse to show oldest to newest (left to right)
+        cols = list(inc_stmt.columns)
+        cols.reverse()
+
+        def safe_get(df, index_names, col_date):
+            if df is None or df.empty:
+                return 0
+            for name in index_names:
+                if name in df.index:
+                    val = df.loc[name, col_date]
+                    if pd.notna(val):
+                        return float(val)
+            return 0
+
+        for col in cols:
+            dt = pd.to_datetime(col)
+            quarter_str = dt.strftime("%b %Y")
+            
+            sales = safe_get(inc_stmt, ['Total Revenue', 'Operating Revenue'], col)
+            op_profit = safe_get(inc_stmt, ['Operating Income'], col)
+            expenses = safe_get(inc_stmt, ['Total Expenses', 'Operating Expense'], col)
+            if expenses == 0 and sales != 0 and op_profit != 0:
+                expenses = sales - op_profit
+            
+            opm = op_profit / sales if sales > 0 else 0
+            
+            other_inc = safe_get(inc_stmt, ['Other Non Operating Income Expenses', 'Net Non Operating Interest Income Expense'], col)
+            interest = safe_get(inc_stmt, ['Interest Expense', 'Interest Expense Non Operating'], col)
+            
+            depreciation = safe_get(cash_flow, ['Depreciation And Amortization', 'Depreciation'], col)
+            if depreciation == 0:
+                depreciation = safe_get(inc_stmt, ['Reconciled Depreciation'], col)
+                
+            pbt = safe_get(inc_stmt, ['Pretax Income'], col)
+            tax = safe_get(inc_stmt, ['Tax Provision'], col)
+            tax_pct = tax / pbt if pbt != 0 else 0
+            
+            net_profit = safe_get(inc_stmt, ['Net Income', 'Net Income Continuous Operations'], col)
+            eps = safe_get(inc_stmt, ['Basic EPS', 'Diluted EPS'], col)
+            
+            results.append({
+                "quarter": quarter_str,
+                "sales": sales,
+                "expenses": expenses,
+                "operating_profit": op_profit,
+                "opm_pct": opm,
+                "other_income": other_inc,
+                "interest": interest,
+                "depreciation": depreciation,
+                "profit_before_tax": pbt,
+                "tax_pct": tax_pct,
+                "net_profit": net_profit,
+                "eps": eps
+            })
+            
+        return {"s": "ok", "data": results}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to fetch quarterly results: {str(e)}")
+
+@router.get("/wm-spread")
+def get_wm_market_spread(
+    limit: int = Query(30, description="Number of past days to fetch"),
+    db: Session = Depends(get_db)
+):
+    """
+    Fetch WM Market Spread data for the dashboard charts
+    """
+    try:
+        data = db.query(WMMarketSpread).order_by(WMMarketSpread.WMDate.desc()).limit(limit).all()
+        # Sort ascending for charts
+        data = sorted(data, key=lambda x: x.WMDate)
+        
+        return {
+            "status": "success",
+            "data": [
+                {
+                    "WMDate": item.WMDate,
+                    "WMStocksAdvToYesterday": item.WMStocksAdvToYesterday,
+                    "WMStocksDecToYesterday": item.WMStocksDecToYesterday,
+                    "WMStocksAdvFrmOpenToday": item.WMStocksAdvFrmOpenToday,
+                    "WMStocksDecFrmOpenToday": item.WMStocksDecFrmOpenToday,
+                    "WMStockBullVolYesterday": item.WMStockBullVolYesterday,
+                    "WMStockBearVolYesterday": item.WMStockBearVolYesterday,
+                    "WMStockBullVolToday": item.WMStockBullVolToday,
+                    "WMStockBearVolToday": item.WMStockBearVolToday,
+                    "WMTrinYesterday": item.WMTrinYesterday,
+                    "WMTrinToday": item.WMTrinToday,
+                    "WMStocksAbove200EMA": item.WMStocksAbove200EMA,
+                    "WMStocksAbove50EMA": item.WMStocksAbove50EMA
+                }
+                for item in data
+            ]
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/wm-index-sentiment")
+def get_wm_index_sentiment(db: Session = Depends(get_db)):
+    """
+    Fetch WM Index Sentiment Analysis data
+    """
+    try:
+        # Assuming we just want the latest record per index or we fetch a specific date.
+        # Since the database has records for '24/07/2026 00:00', we can fetch all for now or latest.
+        # SQLite with string dates makes it tricky to order by date, but we can group by or just return all and let frontend filter/sort.
+        data = db.query(WMIndexSentimentAnalysis).all()
+        
+        return {
+            "status": "success",
+            "data": [
+                {
+                    "WMDate": item.WMDate,
+                    "WMIndexName": item.WMIndexName,
+                    "WMIndexType": item.WMIndexType,
+                    "WMIndexPosition": item.WMIndexPosition,
+                    "WMIndexPositiontoNifty": item.WMIndexPositiontoNifty,
+                    "WMIndexWSMA30Position": item.WMIndexWSMA30Position,
+                    "WMIndexCurrentPosition": item.WMIndexCurrentPosition
+                }
+                for item in data
+            ]
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))

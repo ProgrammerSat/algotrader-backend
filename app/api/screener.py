@@ -795,3 +795,248 @@ def custom_screener(
         "skipped": len(skipped_details),
         "skipped_details": skipped_details,
     }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Filter Builder — Fyers-native evaluation (no Gemini)
+# ─────────────────────────────────────────────────────────────────────────────
+
+RESOLUTION_MAP = {
+    "Daily":       "D",
+    "Weekly":      "W",
+    "Monthly":     "M",
+    "1 week ago":  "W",
+    "1 month ago": "M",
+}
+
+DAYS_NEEDED = {
+    "D": 365,
+    "W": 365 * 2,
+    "M": 365 * 5,
+}
+
+
+class FBCondition(BaseModel):
+    id: str
+    lhsTimeframe: str
+    lhsField: str
+    lhsArg: str = ""
+    operator: str          # >, <, >=, <=, ==, crosses_above, crosses_below
+    rhsType: str           # "number" | "field"
+    rhsValue: str = "0"
+    rhsTimeframe: str = "Monthly"
+    rhsField: str = "Close"
+    rhsArg: str = ""
+
+
+class FBGroup(BaseModel):
+    id: str
+    logic: str             # "ALL" | "ANY"
+    conditions: List[FBCondition] = []
+    groups: List[Any] = []  # nested FBGroup
+
+
+class FilterBuilderRequest(BaseModel):
+    rootGroup: FBGroup
+    symbols: str = ""      # comma-sep; empty = Nifty 50
+
+
+def _get_series(df: pd.DataFrame, field: str, arg: str, timeframe: str) -> pd.Series:
+    """Return a pandas Series for the given field/arg on the already-fetched df."""
+    field = field.upper()
+    col_map = {
+        "CLOSE": "close", "OPEN": "open", "HIGH": "high",
+        "LOW": "low", "VOLUME": "volume", "VWAP": "vwap",
+    }
+    if field in col_map:
+        col = col_map[field]
+        if col not in df.columns:
+            raise ValueError(f"Column '{col}' not in data")
+        return df[col]
+
+    period = int(arg) if arg else 20
+    if field == "EMA":
+        return df["close"].ewm(span=period, adjust=False).mean()
+    if field == "SMA":
+        return df["close"].rolling(window=period).mean()
+    if field == "RSI":
+        delta = df["close"].diff()
+        gain  = delta.clip(lower=0).rolling(window=period).mean()
+        loss  = (-delta.clip(upper=0)).rolling(window=period).mean()
+        rs    = gain / loss.replace(0, float("nan"))
+        return 100 - (100 / (1 + rs))
+    raise ValueError(f"Unknown field: {field}")
+
+
+def _get_value_at(series: pd.Series, timeframe: str) -> float:
+    """
+    '1 month ago' / '1 week ago'  → second-to-last candle value
+    Everything else                → last candle value
+    """
+    offset = 1 if timeframe in ("1 month ago", "1 week ago") else 0
+    idx = -(1 + offset)
+    vals = series.dropna()
+    if len(vals) < abs(idx):
+        raise ValueError("Not enough data for offset lookup")
+    return float(vals.iloc[idx])
+
+
+def _eval_condition(df_cache: dict, cond: FBCondition, fyers, symbol: str) -> bool:
+    """Evaluate a single condition; fetches/caches candle data per resolution."""
+
+    def get_df(tf: str) -> pd.DataFrame:
+        res = RESOLUTION_MAP.get(tf, "M")
+        if res not in df_cache:
+            days = DAYS_NEEDED.get(res, 365 * 2)
+            today = datetime.today()
+            candles, err = _fetch_chunked_history(
+                fyers, symbol, res,
+                today - timedelta(days=days), today
+            )
+            if err:
+                raise ValueError(err)
+            if not candles or len(candles) < 3:
+                raise ValueError(f"Insufficient {res} data ({len(candles or [])} candles)")
+            df = pd.DataFrame(candles, columns=["ts", "open", "high", "low", "close", "volume"])
+            # Compute VWAP as a simple typical-price × volume / volume rolling proxy
+            df["typical"] = (df["high"] + df["low"] + df["close"]) / 3
+            df["vwap"] = (df["typical"] * df["volume"]).cumsum() / df["volume"].cumsum()
+            df_cache[res] = df
+        return df_cache[res]
+
+    lhs_df  = get_df(cond.lhsTimeframe)
+    lhs_ser = _get_series(lhs_df, cond.lhsField, cond.lhsArg, cond.lhsTimeframe)
+
+    if cond.rhsType == "number":
+        rhs_val = float(cond.rhsValue or "0")
+        lhs_val = _get_value_at(lhs_ser, cond.lhsTimeframe)
+
+        op = cond.operator
+        if op == ">":  return lhs_val > rhs_val
+        if op == "<":  return lhs_val < rhs_val
+        if op == ">=": return lhs_val >= rhs_val
+        if op == "<=": return lhs_val <= rhs_val
+        if op == "==": return abs(lhs_val - rhs_val) < 1e-9
+        # crosses don't make sense vs a static number — treat as >=
+        return lhs_val >= rhs_val
+
+    else:  # field-vs-field
+        rhs_df  = get_df(cond.rhsTimeframe)
+        rhs_ser = _get_series(rhs_df, cond.rhsField, cond.rhsArg, cond.rhsTimeframe)
+        lhs_val  = _get_value_at(lhs_ser, cond.lhsTimeframe)
+        rhs_val  = _get_value_at(rhs_ser, cond.rhsTimeframe)
+
+        op = cond.operator
+        if op == ">":  return lhs_val > rhs_val
+        if op == "<":  return lhs_val < rhs_val
+        if op == ">=": return lhs_val >= rhs_val
+        if op == "<=": return lhs_val <= rhs_val
+        if op == "==": return abs(lhs_val - rhs_val) < 1e-9
+
+        # crosses — need current and previous candle values
+        lhs_prev_tf = "1 month ago" if "month" not in cond.lhsTimeframe else cond.lhsTimeframe
+        lhs_cur  = float(lhs_ser.dropna().iloc[-1])
+        lhs_prev = float(lhs_ser.dropna().iloc[-2])
+        rhs_cur  = float(rhs_ser.dropna().iloc[-1])
+        rhs_prev = float(rhs_ser.dropna().iloc[-2])
+
+        if op == "crosses_above":
+            return lhs_prev <= rhs_prev and lhs_cur > rhs_cur
+        if op == "crosses_below":
+            return lhs_prev >= rhs_prev and lhs_cur < rhs_cur
+        return False
+
+
+def _eval_group(df_cache: dict, group: FBGroup, fyers, symbol: str) -> bool:
+    """Recursively evaluate a filter group (ALL or ANY logic)."""
+    results = []
+
+    for cond in group.conditions:
+        try:
+            results.append(_eval_condition(df_cache, cond, fyers, symbol))
+        except Exception as e:
+            # treat an error on a single condition as "not met"
+            print(f"  ⚠ Condition error ({cond.lhsField} {cond.operator}): {e}")
+            results.append(False)
+
+    # Handle nested sub-groups (only 1 level deep from frontend, but recursive here)
+    for subgroup_dict in (group.groups or []):
+        try:
+            subgroup = FBGroup(**subgroup_dict) if isinstance(subgroup_dict, dict) else subgroup_dict
+            results.append(_eval_group(df_cache, subgroup, fyers, symbol))
+        except Exception as e:
+            print(f"  ⚠ Sub-group error: {e}")
+            results.append(False)
+
+    if not results:
+        return True  # empty group = pass
+
+    return all(results) if group.logic == "ALL" else any(results)
+
+
+@router.post("/filter-builder")
+def filter_builder_screener(
+    req: FilterBuilderRequest,
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Filter Builder Screener — evaluates a filter tree built in the UI
+    directly against Fyers historical data. No Gemini/AI involved.
+    """
+    fyers = get_fyers_client()
+    if not fyers:
+        raise HTTPException(status_code=403, detail="Fyers account not linked.")
+
+    universe = (
+        [s.strip() for s in req.symbols.split(",") if s.strip()]
+        if req.symbols.strip() else NIFTY50_SYMBOLS
+    )
+
+    results = []
+    skipped_details = []
+    total = len(universe)
+
+    print(f"🚀 Filter Builder Scan: {total} symbols")
+
+    for sym in universe:
+        try:
+            df_cache: dict = {}   # cache fetched DataFrames per resolution per symbol
+            matched = _eval_group(df_cache, req.rootGroup, fyers, sym)
+            time.sleep(0.05)      # gentle rate limiting
+
+            if matched:
+                # Pull latest daily candle for price / volume info in the result table
+                if "D" in df_cache:
+                    df = df_cache["D"]
+                elif "M" in df_cache:
+                    df = df_cache["M"]
+                else:
+                    df = list(df_cache.values())[0]
+
+                last   = df.iloc[-1]
+                prev   = df.iloc[-2] if len(df) >= 2 else last
+                chg    = ((last["close"] - prev["close"]) / prev["close"] * 100) if prev["close"] else 0
+
+                results.append({
+                    "symbol":        sym,
+                    "curr_close":    round(float(last["close"]), 2),
+                    "prev_close":    round(float(prev["close"]), 2),
+                    "price_chg_pct": round(chg, 2),
+                    "curr_vol":      int(last["volume"]),
+                })
+
+        except Exception as e:
+            skipped_details.append({"symbol": sym, "reason": str(e)})
+            print(f"  ✗ {sym}: {e}")
+
+    results.sort(key=lambda r: r["price_chg_pct"], reverse=True)
+    print(f"✅ Filter Builder done. Matched: {len(results)}, Skipped: {len(skipped_details)}")
+
+    return {
+        "screener":        "Filter Builder",
+        "scanned":         total,
+        "matched":         len(results),
+        "results":         results,
+        "skipped":         len(skipped_details),
+        "skipped_details": skipped_details,
+    }

@@ -10,7 +10,7 @@ from app.core.database import get_db
 from app.deps import get_current_user
 from app.models.user import User
 from app.models.trade_log import TradeLog
-from app.schemas.trade_log import TradeLogCreate, TradeLogOut
+from app.schemas.trade_log import TradeLogCreate, TradeLogOut, TradeLogUpdate
 
 router = APIRouter(prefix="/api/trades", tags=["trades"])
 
@@ -58,8 +58,45 @@ def log_trade(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    log = TradeLog(user_id=current_user.id, **payload.model_dump())
+    log = TradeLog(user_id=current_user.id, **payload.model_dump(exclude_unset=True))
     db.add(log)
     db.commit()
     db.refresh(log)
     return log
+
+
+@router.patch("/{trade_id}", response_model=TradeLogOut)
+def update_trade(
+    trade_id: int,
+    payload: TradeLogUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    from fastapi import HTTPException
+    log = db.query(TradeLog).filter(TradeLog.id == trade_id, TradeLog.user_id == current_user.id).first()
+    if not log:
+        raise HTTPException(status_code=404, detail="Trade log not found")
+    
+    update_data = payload.model_dump(exclude_unset=True)
+    for key, value in update_data.items():
+        setattr(log, key, value)
+        
+    db.commit()
+    db.refresh(log)
+    return log
+
+
+@router.delete("/{trade_id}")
+def delete_trade(
+    trade_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    from fastapi import HTTPException
+    log = db.query(TradeLog).filter(TradeLog.id == trade_id, TradeLog.user_id == current_user.id).first()
+    if not log:
+        raise HTTPException(status_code=404, detail="Trade log not found")
+        
+    db.delete(log)
+    db.commit()
+    return {"message": "Trade log deleted"}
